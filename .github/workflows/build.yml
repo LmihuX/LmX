@@ -1,0 +1,446 @@
+name: Build LmX
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Prepare project
+        run: |
+          git clone --depth 1 -b 1.21.11 https://github.com/FabricMC/fabric-example-mod lmx
+          cd lmx
+          rm -rf src/main/java src/client src/main/resources/assets/modid
+          rm -f src/main/resources/*.mixins.json
+          sed -i 's/"modid"/"lmx"/' build.gradle
+          mkdir -p src/client/java/dev/lmx
+          cat > src/client/java/dev/lmx/Module.java <<'LMX_EOF'
+          package dev.lmx;
+
+          import net.minecraft.client.Minecraft;
+
+          public abstract class Module {
+              public final String name;
+              public final String description;
+              private boolean enabled;
+
+              protected Module(String name, String description) {
+                  this.name = name;
+                  this.description = description;
+              }
+
+              public boolean isEnabled() {
+                  return enabled;
+              }
+
+              public void toggle() {
+                  setEnabled(!enabled);
+              }
+
+              public void setEnabled(boolean value) {
+                  if (value == enabled) return;
+                  enabled = value;
+                  if (value) onEnable(); else onDisable();
+              }
+
+              public void onEnable() {}
+
+              public void onDisable() {}
+
+              public void onTick(Minecraft mc) {}
+          }
+          LMX_EOF
+          mkdir -p src/client/java/dev/lmx
+          cat > src/client/java/dev/lmx/ModuleManager.java <<'LMX_EOF'
+          package dev.lmx;
+
+          import net.minecraft.client.Minecraft;
+          import net.minecraft.client.player.LocalPlayer;
+          import net.minecraft.world.effect.MobEffectInstance;
+          import net.minecraft.world.effect.MobEffects;
+
+          import java.util.ArrayList;
+          import java.util.List;
+
+          public final class ModuleManager {
+              public static final List<Module> ALL = new ArrayList<>();
+
+              // Функции
+              public static final Module FULLBRIGHT = add(new Fullbright());
+              public static final Module ZOOM = add(new Zoom());
+              public static final Module AUTO_SPRINT = add(new AutoSprint());
+
+              // Элементы интерфейса
+              public static final Module WATERMARK = add(new Simple("Watermark", "Название мода и FPS в углу", true));
+              public static final Module MODULE_LIST = add(new Simple("ArrayList", "Список включённых модулей справа", true));
+              public static final Module COORDS = add(new Simple("Coordinates", "Координаты и направление", true));
+              public static final Module KEYSTROKES = add(new Simple("Keystrokes", "Нажатые клавиши WASD", false));
+
+              private ModuleManager() {}
+
+              private static <T extends Module> T add(T module) {
+                  ALL.add(module);
+                  return module;
+              }
+
+              public static void tick(Minecraft mc) {
+                  for (Module m : ALL) {
+                      m.onTick(mc);
+                  }
+              }
+
+              /** Модуль без логики: просто флаг, который читает HUD. */
+              public static class Simple extends Module {
+                  public Simple(String name, String description, boolean on) {
+                      super(name, description);
+                      if (on) setEnabled(true);
+                  }
+              }
+
+              /** Полная яркость через клиентский эффект ночного зрения. */
+              public static class Fullbright extends Module {
+                  private boolean applied;
+
+                  public Fullbright() {
+                      super("Fullbright", "Полная яркость без факелов");
+                  }
+
+                  @Override
+                  public void onTick(Minecraft mc) {
+                      LocalPlayer player = mc.player;
+                      if (player == null) return;
+                      if (isEnabled()) {
+                          player.addEffect(new MobEffectInstance(MobEffects.NIGHT_VISION, 1000, 0, false, false, false));
+                          applied = true;
+                      } else if (applied) {
+                          player.removeEffect(MobEffects.NIGHT_VISION);
+                          applied = false;
+                      }
+                  }
+
+                  @Override
+                  public void onDisable() {
+                      Minecraft mc = Minecraft.getInstance();
+                      if (applied && mc.player != null) {
+                          mc.player.removeEffect(MobEffects.NIGHT_VISION);
+                      }
+                      applied = false;
+                  }
+              }
+
+              /** Зум на удерживаемую клавишу (по умолчанию C). */
+              public static class Zoom extends Module {
+                  private Integer savedFov;
+
+                  public Zoom() {
+                      super("Zoom", "Приближение при удержании клавиши");
+                  }
+
+                  @Override
+                  public void onTick(Minecraft mc) {
+                      var option = mc.options.fov();
+                      boolean zooming = isEnabled() && LmXClient.ZOOM_KEY.isDown();
+                      if (zooming) {
+                          if (savedFov == null) savedFov = option.get();
+                          option.set(30);
+                      } else if (savedFov != null) {
+                          option.set(savedFov);
+                          savedFov = null;
+                      }
+                  }
+
+                  @Override
+                  public void onDisable() {
+                      if (savedFov != null) {
+                          Minecraft.getInstance().options.fov().set(savedFov);
+                          savedFov = null;
+                      }
+                  }
+              }
+
+              /** Автоматический спринт при движении вперёд. */
+              public static class AutoSprint extends Module {
+                  public AutoSprint() {
+                      super("AutoSprint", "Бежать, не зажимая Ctrl");
+                  }
+
+                  @Override
+                  public void onTick(Minecraft mc) {
+                      LocalPlayer player = mc.player;
+                      if (!isEnabled() || player == null) return;
+                      boolean forward = mc.options.keyUp.isDown();
+                      if (forward && !player.isShiftKeyDown() && !player.horizontalCollision
+                              && player.getFoodData().getFoodLevel() > 6) {
+                          player.setSprinting(true);
+                      }
+                  }
+              }
+          }
+          LMX_EOF
+          mkdir -p src/client/java/dev/lmx
+          cat > src/client/java/dev/lmx/LmXClient.java <<'LMX_EOF'
+          package dev.lmx;
+
+          import com.mojang.blaze3d.platform.InputConstants;
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+          import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+          import net.minecraft.client.KeyMapping;
+          import net.minecraft.resources.Identifier;
+          import org.lwjgl.glfw.GLFW;
+
+          public class LmXClient implements ClientModInitializer {
+              public static final String MOD_ID = "lmx";
+
+              private static final KeyMapping.Category CATEGORY =
+                      KeyMapping.Category.register(Identifier.fromNamespaceAndPath(MOD_ID, "main"));
+
+              public static final KeyMapping GUI_KEY = KeyBindingHelper.registerKeyBinding(
+                      new KeyMapping("key.lmx.gui", InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_RIGHT_SHIFT, CATEGORY));
+
+              public static final KeyMapping ZOOM_KEY = KeyBindingHelper.registerKeyBinding(
+                      new KeyMapping("key.lmx.zoom", InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_C, CATEGORY));
+
+              @Override
+              public void onInitializeClient() {
+                  Hud.init();
+                  ClientTickEvents.END_CLIENT_TICK.register(client -> {
+                      while (GUI_KEY.consumeClick()) {
+                          client.setScreen(new ClickGui());
+                      }
+                      if (client.player != null) {
+                          ModuleManager.tick(client);
+                      }
+                  });
+              }
+          }
+          LMX_EOF
+          mkdir -p src/client/java/dev/lmx
+          cat > src/client/java/dev/lmx/Hud.java <<'LMX_EOF'
+          package dev.lmx;
+
+          import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElementRegistry;
+          import net.fabricmc.fabric.api.client.rendering.v1.hud.VanillaHudElements;
+          import net.minecraft.client.DeltaTracker;
+          import net.minecraft.client.Minecraft;
+          import net.minecraft.client.gui.Font;
+          import net.minecraft.client.gui.GuiGraphics;
+          import net.minecraft.resources.Identifier;
+
+          import java.awt.Color;
+          import java.util.ArrayList;
+          import java.util.Comparator;
+          import java.util.List;
+
+          public final class Hud {
+              private static final int BG = 0x90000000;
+
+              private Hud() {}
+
+              public static void init() {
+                  HudElementRegistry.attachElementAfter(
+                          VanillaHudElements.CHAT,
+                          Identifier.fromNamespaceAndPath(LmXClient.MOD_ID, "hud"),
+                          Hud::render);
+              }
+
+              /** Плавно переливающийся цвет; offset сдвигает фазу для соседних строк. */
+              private static int rainbow(int offset) {
+                  float hue = ((System.currentTimeMillis() / 20 + offset * 12L) % 360) / 360f;
+                  return Color.HSBtoRGB(hue, 0.6f, 1f) | 0xFF000000;
+              }
+
+              private static void render(GuiGraphics g, DeltaTracker tickCounter) {
+                  Minecraft mc = Minecraft.getInstance();
+                  if (mc.player == null || mc.options.hideGui) return;
+                  Font font = mc.font;
+                  int width = g.guiWidth();
+                  int height = g.guiHeight();
+
+                  if (ModuleManager.WATERMARK.isEnabled()) drawWatermark(g, mc, font);
+                  if (ModuleManager.MODULE_LIST.isEnabled()) drawModuleList(g, font, width);
+                  if (ModuleManager.COORDS.isEnabled()) drawCoords(g, mc, font, height);
+                  if (ModuleManager.KEYSTROKES.isEnabled()) drawKeystrokes(g, mc, font, width, height);
+              }
+
+              private static void drawWatermark(GuiGraphics g, Minecraft mc, Font font) {
+                  String text = "LmX | " + mc.getFps() + " FPS";
+                  int w = font.width(text) + 10;
+                  g.fill(4, 4, 4 + w, 18, BG);
+                  g.fill(4, 4, 4 + w, 5, rainbow(0));
+                  g.drawString(font, text, 9, 8, 0xFFFFFFFF);
+              }
+
+              private static void drawModuleList(GuiGraphics g, Font font, int screenWidth) {
+                  List<Module> active = new ArrayList<>();
+                  for (Module m : ModuleManager.ALL) {
+                      if (m.isEnabled() && m != ModuleManager.MODULE_LIST) active.add(m);
+                  }
+                  active.sort(Comparator.comparingInt((Module m) -> font.width(m.name)).reversed());
+
+                  int y = 4;
+                  int i = 0;
+                  for (Module m : active) {
+                      int w = font.width(m.name);
+                      int x = screenWidth - w - 8;
+                      int color = rainbow(i++);
+                      g.fill(x - 3, y, screenWidth - 2, y + 12, BG);
+                      g.fill(screenWidth - 3, y, screenWidth - 1, y + 12, color);
+                      g.drawString(font, m.name, x, y + 2, color);
+                      y += 12;
+                  }
+              }
+
+              private static void drawCoords(GuiGraphics g, Minecraft mc, Font font, int height) {
+                  String pos = String.format("XYZ: %.1f / %.1f / %.1f", mc.player.getX(), mc.player.getY(), mc.player.getZ());
+                  String dir = "Куда смотрю: " + mc.player.getDirection().getName();
+                  int w = Math.max(font.width(pos), font.width(dir)) + 10;
+                  int top = height - 36;
+                  g.fill(4, top, 4 + w, height - 4, BG);
+                  g.fill(4, top, 6, height - 4, rainbow(2));
+                  g.drawString(font, pos, 11, top + 5, 0xFFFFFFFF);
+                  g.drawString(font, dir, 11, top + 18, 0xFFBBBBBB);
+              }
+
+              private static void drawKeystrokes(GuiGraphics g, Minecraft mc, Font font, int width, int height) {
+                  int size = 20;
+                  int gap = 2;
+                  int baseX = width - 3 * size - 2 * gap - 8;
+                  int baseY = height - 2 * size - gap - 8;
+                  key(g, font, baseX + size + gap, baseY, size, "W", mc.options.keyUp.isDown());
+                  key(g, font, baseX, baseY + size + gap, size, "A", mc.options.keyLeft.isDown());
+                  key(g, font, baseX + size + gap, baseY + size + gap, size, "S", mc.options.keyDown.isDown());
+                  key(g, font, baseX + 2 * (size + gap), baseY + size + gap, size, "D", mc.options.keyRight.isDown());
+              }
+
+              private static void key(GuiGraphics g, Font font, int x, int y, int size, String label, boolean down) {
+                  g.fill(x, y, x + size, y + size, down ? 0xC0FFFFFF : BG);
+                  int tx = x + (size - font.width(label)) / 2;
+                  g.drawString(font, label, tx, y + 6, down ? 0xFF000000 : 0xFFFFFFFF, false);
+              }
+          }
+          LMX_EOF
+          mkdir -p src/client/java/dev/lmx
+          cat > src/client/java/dev/lmx/ClickGui.java <<'LMX_EOF'
+          package dev.lmx;
+
+          import net.minecraft.client.gui.GuiGraphics;
+          import net.minecraft.client.gui.components.Button;
+          import net.minecraft.client.gui.screens.Screen;
+          import net.minecraft.network.chat.Component;
+
+          import java.util.HashMap;
+          import java.util.Map;
+
+          /** Окно модулей: открывается на Right Shift, закрывается на Esc. */
+          public class ClickGui extends Screen {
+              private static final int PANEL_W = 180;
+              private static final int ROW_H = 24;
+
+              private final Map<Module, Button> buttons = new HashMap<>();
+
+              public ClickGui() {
+                  super(Component.literal("LmX"));
+              }
+
+              private int panelTop() {
+                  int rows = ModuleManager.ALL.size();
+                  return this.height / 2 - (rows * ROW_H + 40) / 2;
+              }
+
+              @Override
+              protected void init() {
+                  buttons.clear();
+                  int x = this.width / 2 - (PANEL_W - 20) / 2;
+                  int y = panelTop() + 30;
+                  for (Module module : ModuleManager.ALL) {
+                      Button button = Button.builder(label(module), b -> {
+                          module.toggle();
+                          b.setMessage(label(module));
+                      }).bounds(x, y, PANEL_W - 20, ROW_H - 4).build();
+                      addRenderableWidget(button);
+                      buttons.put(module, button);
+                      y += ROW_H;
+                  }
+              }
+
+              private static Component label(Module module) {
+                  return Component.literal(module.name + ": " + (module.isEnabled() ? "ВКЛ" : "выкл"));
+              }
+
+              @Override
+              public void renderBackground(GuiGraphics g, int mouseX, int mouseY, float delta) {
+                  super.renderBackground(g, mouseX, mouseY, delta);
+                  int left = this.width / 2 - PANEL_W / 2;
+                  int top = panelTop();
+                  int bottom = top + ModuleManager.ALL.size() * ROW_H + 40;
+                  g.fillGradient(left, top, left + PANEL_W, bottom, 0xE0141428, 0xE02A1450);
+                  g.fill(left, top, left + PANEL_W, top + 2, 0xFF8B5CF6);
+                  g.drawCenteredString(this.font, "LmX", this.width / 2, top + 10, 0xFFFFFFFF);
+              }
+
+              @Override
+              public void render(GuiGraphics g, int mouseX, int mouseY, float delta) {
+                  super.render(g, mouseX, mouseY, delta);
+                  for (Map.Entry<Module, Button> e : buttons.entrySet()) {
+                      if (e.getValue().isHovered()) {
+                          g.drawCenteredString(this.font, e.getKey().description,
+                                  this.width / 2, panelTop() + ModuleManager.ALL.size() * ROW_H + 50, 0xFFBBBBBB);
+                      }
+                  }
+              }
+
+              @Override
+              public boolean isPauseScreen() {
+                  return false;
+              }
+          }
+          LMX_EOF
+          mkdir -p src/main/resources
+          cat > src/main/resources/fabric.mod.json <<'LMX_EOF'
+          {
+            "schemaVersion": 1,
+            "id": "lmx",
+            "version": "${version}",
+            "name": "LmX",
+            "description": "Клиентский мод: красивый HUD, окно модулей, полная яркость, зум, автоспринт.",
+            "authors": ["you"],
+            "environment": "client",
+            "entrypoints": {
+              "client": ["dev.lmx.LmXClient"]
+            },
+            "depends": {
+              "fabricloader": ">=0.17.0",
+              "minecraft": "~1.21.11",
+              "java": ">=21",
+              "fabric-api": "*"
+            }
+          }
+          LMX_EOF
+          mkdir -p src/main/resources/assets/lmx/lang
+          cat > src/main/resources/assets/lmx/lang/en_us.json <<'LMX_EOF'
+          {
+            "key.category.lmx.main": "LmX",
+            "key.lmx.gui": "Открыть окно модулей",
+            "key.lmx.zoom": "Зум (удерживать)"
+          }
+          LMX_EOF
+
+      - name: Build
+        working-directory: lmx
+        run: |
+          chmod +x gradlew
+          ./gradlew build --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lmx-mod
+          path: |
+            lmx/build/libs/*.jar
+            !lmx/build/libs/*-sources.jar
