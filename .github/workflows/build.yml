@@ -81,6 +81,8 @@ jobs:
               public static final Module MODULE_LIST = add(new Simple("ArrayList", "Список включённых модулей справа", true));
               public static final Module COORDS = add(new Simple("Coordinates", "Координаты и направление", true));
               public static final Module KEYSTROKES = add(new Simple("Keystrokes", "Нажатые клавиши WASD", false));
+              public static final Module ARMOR = add(new Simple("ArmorHUD", "Броня и её прочность слева внизу", true));
+              public static final Module EFFECTS = add(new Simple("PotionHUD", "Активные эффекты и время до конца", true));
 
               private ModuleManager() {}
 
@@ -232,8 +234,13 @@ jobs:
           import net.minecraft.client.gui.Font;
           import net.minecraft.client.gui.GuiGraphics;
           import net.minecraft.resources.Identifier;
+          import net.minecraft.world.effect.MobEffectInstance;
+          import net.minecraft.world.entity.EquipmentSlot;
+          import net.minecraft.world.item.ItemStack;
 
           import java.awt.Color;
+          import java.time.LocalTime;
+          import java.time.format.DateTimeFormatter;
           import java.util.ArrayList;
           import java.util.Comparator;
           import java.util.List;
@@ -251,7 +258,7 @@ jobs:
               }
 
               /** Плавно переливающийся цвет; offset сдвигает фазу для соседних строк. */
-              private static int rainbow(int offset) {
+              static int rainbow(int offset) {
                   float hue = ((System.currentTimeMillis() / 20 + offset * 12L) % 360) / 360f;
                   return Color.HSBtoRGB(hue, 0.6f, 1f) | 0xFF000000;
               }
@@ -267,10 +274,12 @@ jobs:
                   if (ModuleManager.MODULE_LIST.isEnabled()) drawModuleList(g, font, width);
                   if (ModuleManager.COORDS.isEnabled()) drawCoords(g, mc, font, height);
                   if (ModuleManager.KEYSTROKES.isEnabled()) drawKeystrokes(g, mc, font, width, height);
+                  if (ModuleManager.EFFECTS.isEnabled()) drawEffects(g, mc, font);
+                  if (ModuleManager.ARMOR.isEnabled()) drawArmor(g, mc, font, height);
               }
 
               private static void drawWatermark(GuiGraphics g, Minecraft mc, Font font) {
-                  String text = "LmX | " + mc.getFps() + " FPS";
+                  String text = "LmX | " + mc.getFps() + " FPS | " + LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm"));
                   int w = font.width(text) + 10;
                   g.fill(4, 4, 4 + w, 18, BG);
                   g.fill(4, 4, 4 + w, 5, rainbow(0));
@@ -308,6 +317,41 @@ jobs:
                   g.drawString(font, dir, 11, top + 18, 0xFFBBBBBB);
               }
 
+              private static void drawEffects(GuiGraphics g, Minecraft mc, Font font) {
+                  int y = 24;
+                  int i = 0;
+                  for (MobEffectInstance effect : mc.player.getActiveEffects()) {
+                      int seconds = Math.max(0, effect.getDuration() / 20);
+                      String time = effect.getDuration() < 0 ? "∞" : String.format("%d:%02d", seconds / 60, seconds % 60);
+                      String name = effect.getEffect().value().getDisplayName().getString();
+                      String text = name + " " + (effect.getAmplifier() + 1) + "  " + time;
+                      int w = font.width(text) + 10;
+                      g.fill(4, y, 4 + w, y + 12, BG);
+                      g.fill(4, y, 6, y + 12, rainbow(i++));
+                      g.drawString(font, text, 10, y + 2, 0xFFFFFFFF);
+                      y += 13;
+                  }
+              }
+
+              private static void drawArmor(GuiGraphics g, Minecraft mc, Font font, int height) {
+                  EquipmentSlot[] slots = {EquipmentSlot.HEAD, EquipmentSlot.CHEST, EquipmentSlot.LEGS, EquipmentSlot.FEET};
+                  int y = height - 44 - slots.length * 20;
+                  for (EquipmentSlot slot : slots) {
+                      ItemStack stack = mc.player.getItemBySlot(slot);
+                      if (!stack.isEmpty()) {
+                          g.fill(4, y, 62, y + 18, BG);
+                          g.renderItem(stack, 6, y + 1);
+                          int max = stack.getMaxDamage();
+                          if (max > 0) {
+                              int pct = (max - stack.getDamageValue()) * 100 / max;
+                              int color = pct > 60 ? 0xFF55FF55 : pct > 25 ? 0xFFFFFF55 : 0xFFFF5555;
+                              g.drawString(font, pct + "%", 28, y + 5, color);
+                          }
+                      }
+                      y += 20;
+                  }
+              }
+
               private static void drawKeystrokes(GuiGraphics g, Minecraft mc, Font font, int width, int height) {
                   int size = 20;
                   int gap = 2;
@@ -336,42 +380,77 @@ jobs:
           import net.minecraft.network.chat.Component;
 
           import java.util.HashMap;
+          import java.util.LinkedHashMap;
           import java.util.Map;
 
-          /** Окно модулей: открывается на Right Shift, закрывается на Esc. */
+          /**
+           * Окно модулей: открывается на Right Shift, закрывается на Esc.
+           * Обычные кнопки Minecraft сделаны невидимыми и нужны только для кликов,
+           * а вид рисуется заново: скруглённые плашки, свечение, плавные анимации.
+           */
           public class ClickGui extends Screen {
-              private static final int PANEL_W = 180;
-              private static final int ROW_H = 24;
+              private static final int PANEL_W = 210;
+              private static final int ROW_H = 28;
+              private static final int PAD = 12;
 
-              private final Map<Module, Button> buttons = new HashMap<>();
+              private final Map<Module, Button> buttons = new LinkedHashMap<>();
+              private final Map<Module, float[]> anim = new HashMap<>(); // [0] наведение, [1] включён
 
               public ClickGui() {
                   super(Component.literal("LmX"));
               }
 
+              private int panelH() {
+                  return ModuleManager.ALL.size() * ROW_H + 52;
+              }
+
               private int panelTop() {
-                  int rows = ModuleManager.ALL.size();
-                  return this.height / 2 - (rows * ROW_H + 40) / 2;
+                  return this.height / 2 - panelH() / 2;
               }
 
               @Override
               protected void init() {
                   buttons.clear();
-                  int x = this.width / 2 - (PANEL_W - 20) / 2;
-                  int y = panelTop() + 30;
+                  int x = this.width / 2 - (PANEL_W - PAD * 2) / 2;
+                  int y = panelTop() + 40;
                   for (Module module : ModuleManager.ALL) {
-                      Button button = Button.builder(label(module), b -> {
-                          module.toggle();
-                          b.setMessage(label(module));
-                      }).bounds(x, y, PANEL_W - 20, ROW_H - 4).build();
+                      Button button = Button.builder(Component.empty(), b -> module.toggle())
+                              .bounds(x, y, PANEL_W - PAD * 2, ROW_H - 4).build();
+                      button.setAlpha(0f);
                       addRenderableWidget(button);
                       buttons.put(module, button);
+                      anim.computeIfAbsent(module, m -> new float[]{0f, m.isEnabled() ? 1f : 0f});
                       y += ROW_H;
                   }
               }
 
-              private static Component label(Module module) {
-                  return Component.literal(module.name + ": " + (module.isEnabled() ? "ВКЛ" : "выкл"));
+              // ---------- рисование ----------
+
+              private static int lerpColor(int a, int b, float t) {
+                  t = Math.max(0f, Math.min(1f, t));
+                  int ca = (a >>> 24) & 255, ra = (a >> 16) & 255, ga = (a >> 8) & 255, ba = a & 255;
+                  int cb = (b >>> 24) & 255, rb = (b >> 16) & 255, gb = (b >> 8) & 255, bb = b & 255;
+                  return ((int) (ca + (cb - ca) * t) << 24) | ((int) (ra + (rb - ra) * t) << 16)
+                          | ((int) (ga + (gb - ga) * t) << 8) | (int) (ba + (bb - ba) * t);
+              }
+
+              private static float approach(float value, float target, float speed) {
+                  float d = target - value;
+                  return Math.abs(d) < 0.01f ? target : value + d * speed;
+              }
+
+              /** Прямоугольник со скруглёнными углами, собранный из строк пикселей. */
+              private static void roundRect(GuiGraphics g, int x, int y, int w, int h, int r, int color) {
+                  r = Math.min(r, Math.min(w, h) / 2);
+                  for (int i = 0; i < h; i++) {
+                      int inset = 0;
+                      if (i < r) inset = r - (int) Math.round(Math.sqrt((double) r * r - (double) (r - i - 0.5) * (r - i - 0.5)));
+                      else if (i >= h - r) {
+                          int j = h - 1 - i;
+                          inset = r - (int) Math.round(Math.sqrt((double) r * r - (double) (r - j - 0.5) * (r - j - 0.5)));
+                      }
+                      g.fill(x + inset, y + i, x + w - inset, y + i + 1, color);
+                  }
               }
 
               @Override
@@ -379,20 +458,66 @@ jobs:
                   super.renderBackground(g, mouseX, mouseY, delta);
                   int left = this.width / 2 - PANEL_W / 2;
                   int top = panelTop();
-                  int bottom = top + ModuleManager.ALL.size() * ROW_H + 40;
-                  g.fillGradient(left, top, left + PANEL_W, bottom, 0xE0141428, 0xE02A1450);
-                  g.fill(left, top, left + PANEL_W, top + 2, 0xFF8B5CF6);
-                  g.drawCenteredString(this.font, "LmX", this.width / 2, top + 10, 0xFFFFFFFF);
+                  int h = panelH();
+                  int accent = Hud.rainbow(0) & 0x00FFFFFF;
+
+                  // свечение вокруг панели
+                  for (int i = 8; i >= 1; i--) {
+                      roundRect(g, left - i, top - i, PANEL_W + i * 2, h + i * 2, 12 + i, ((0x0E) << 24) | accent);
+                  }
+                  roundRect(g, left, top, PANEL_W, h, 12, 0xF0121220);
+                  // верхняя полоса с переливом
+                  for (int px = 0; px < PANEL_W - 24; px += 2) {
+                      g.fill(left + 12 + px, top + 2, left + 12 + px + 2, top + 4, Hud.rainbow(px / 6));
+                  }
+                  g.drawCenteredString(this.font, "LmX", this.width / 2, top + 14, 0xFFFFFFFF);
+                  g.drawCenteredString(this.font, "Right Shift — закрыть окно", this.width / 2, top + 26, 0xFF7C7C99);
               }
 
               @Override
               public void render(GuiGraphics g, int mouseX, int mouseY, float delta) {
                   super.render(g, mouseX, mouseY, delta);
+                  Module hovered = null;
+
                   for (Map.Entry<Module, Button> e : buttons.entrySet()) {
-                      if (e.getValue().isHovered()) {
-                          g.drawCenteredString(this.font, e.getKey().description,
-                                  this.width / 2, panelTop() + ModuleManager.ALL.size() * ROW_H + 50, 0xFFBBBBBB);
+                      Module m = e.getKey();
+                      Button b = e.getValue();
+                      float[] a = anim.get(m);
+                      a[0] = approach(a[0], b.isHovered() ? 1f : 0f, 0.25f);
+                      a[1] = approach(a[1], m.isEnabled() ? 1f : 0f, 0.18f);
+                      if (b.isHovered()) hovered = m;
+
+                      int x = b.getX(), y = b.getY(), w = b.getWidth(), h = b.getHeight();
+                      int accent = Hud.rainbow(y / 8);
+                      int accentRgb = accent & 0x00FFFFFF;
+
+                      // свечение включённого модуля
+                      if (a[1] > 0.05f) {
+                          int alpha = (int) (0x16 * a[1]);
+                          for (int i = 3; i >= 1; i--) {
+                              roundRect(g, x - i, y - i, w + i * 2, h + i * 2, 8 + i, (alpha << 24) | accentRgb);
+                          }
                       }
+                      // плашка
+                      roundRect(g, x, y, w, h, 8, lerpColor(0xFF1B1B2E, 0xFF2A2650, Math.max(a[0] * 0.7f, a[1] * 0.5f)));
+                      // цветная полоска слева у включённого
+                      if (a[1] > 0.05f) {
+                          roundRect(g, x + 3, y + 5, 3, h - 10, 1, ((int) (255 * a[1]) << 24) | accentRgb);
+                      }
+                      // название
+                      g.drawString(this.font, m.name, x + 12, y + (h - 8) / 2,
+                              lerpColor(0xFFB8B8CC, 0xFFFFFFFF, Math.max(a[0], a[1])));
+                      // переключатель
+                      int tw = 28, th = 12;
+                      int tx = x + w - tw - 8, ty = y + (h - th) / 2;
+                      roundRect(g, tx, ty, tw, th, 6, lerpColor(0xFF3A3A50, accent, a[1]));
+                      int knobX = tx + 2 + (int) ((tw - th) * a[1]);
+                      roundRect(g, knobX, ty + 2, th - 4, th - 4, 4, 0xFFFFFFFF);
+                  }
+
+                  if (hovered != null) {
+                      g.drawCenteredString(this.font, hovered.description, this.width / 2,
+                              panelTop() + panelH() + 10, 0xFFCFCFE6);
                   }
               }
 
